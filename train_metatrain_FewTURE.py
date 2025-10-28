@@ -26,6 +26,8 @@ from tqdm import tqdm
 import models
 import utils
 from datasets.samplers import CategoriesSampler
+from models.losses import build_query_loss
+from utils_pkg.attn_crops import vit_attention_rollout, swin_token_saliency, heatmap_to_boxes, extract_crops_from_boxes, merge_probs
 
 ####################################################################
 USE_WANDB = False
@@ -55,6 +57,7 @@ def get_args_parser():
                             architectures.""")
 
     # FSL task/scenario related parameters
+    
     parser.add_argument('--n_way', type=int, default=5)
     parser.add_argument('--k_shot', type=int, default=5)
     parser.add_argument('--query', type=int, default=15)
@@ -64,6 +67,22 @@ def get_args_parser():
                         help="""Maximum number of epochs for meta fine tuning. """)
     parser.add_argument('--num_validation_episodes', type=int, default=600,
                         help="""Number of episodes used for validation. """)
+
+    # Attention/Grad-CAM crops (multi-scale) for training
+    parser.add_argument('--use_attn_crops', type=utils.bool_flag, default=False,
+                        help='Enable 2-stage: global -> heatmap -> local crops -> merge for query logits during training.')
+    parser.add_argument('--heatmap_method', type=str, default='attn', choices=['attn', 'gradcam'],
+                        help='Heatmap method. Current implementation uses attention rollout for ViT and token saliency for Swin when attn.')
+    parser.add_argument('--num_local_crops', type=int, default=6, help='Number of local crops per query image.')
+    parser.add_argument('--crop_size', type=int, default=320, help='Resize each local crop to this square size.')
+    parser.add_argument('--w_local', type=float, default=0.65, help='Weight for local predictions in merge.')
+
+    # Query loss options
+    parser.add_argument('--query_loss', type=str, default='ce', choices=['ce', 'focal', 'cb', 'cb_focal'],
+                        help='Loss used on query logits.')
+    parser.add_argument('--beta_cb', type=float, default=0.9995, help='Beta for Class-Balanced.')
+    parser.add_argument('--gamma_focal', type=float, default=2.0, help='Gamma for Focal.')
+    parser.add_argument('--label_smoothing', type=float, default=0.05, help='Label smoothing for CE/CB-CE.')
 
     # Optimisation outer loop -- meta fine-tuning
     parser.add_argument('--meta_lr', type=float, default=0.0002,
@@ -108,7 +127,7 @@ def get_args_parser():
     parser.add_argument('--image_size', type=int, default=224,
                         help="""Size of the squared input images, 224 for imagenet-style.""")
     parser.add_argument('--dataset', default='miniimagenet', type=str,
-                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs'],
+                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs', 'tea_leaves'],
                         help='Please specify the name of the dataset to be used for training.')
     parser.add_argument('--data_path', required=True, type=str,
                         help='Please specify path to the root folder containing the training dataset(s). If dataset '
@@ -153,6 +172,8 @@ def set_up_dataset(args):
         # (Bertinetto et al., 2018) CIFAR-FS (100) -- orig. images 32x32
         # train num_class = 64
         from datasets.dataloaders.cifar_fs.cifar_fs import DatasetLoader as dataset
+    elif args.dataset == 'tea_leaves':
+        from datasets.dataloaders.tea_leaves.tea_leaves import DatasetLoader as dataset
     else:
         raise ValueError('Unknown dataset. Please check your selection!')
     return dataset
@@ -234,7 +255,8 @@ def run_validation(model, patchfsl, data_loader, args, epoch):
                 # optimise patch importance weights based on support set information and predict query logits
                 query_pred_logits = patchfsl(emb_support, emb_support, emb_query, label_support)
 
-            loss = F.cross_entropy(query_pred_logits, label_query)
+            # Compute validation loss (CE with optional smoothing)
+            loss = F.cross_entropy(query_pred_logits, label_query, label_smoothing=args.label_smoothing)
 
             val_acc = utils.count_acc(query_pred_logits, label_query) * 100
             val_ave_acc.add(val_acc)
@@ -261,6 +283,7 @@ def run_validation(model, patchfsl, data_loader, args, epoch):
 class PatchFSL(nn.Module):
     def __init__(self, args, sup_emb_key_seq_len, sup_emb_query_seq_len):
         super(PatchFSL, self).__init__()
+        self.args = args
         self.total_len_support_key = args.n_way * args.k_shot * sup_emb_key_seq_len
         # Mask to prevent image self-classification during adaptation
         if args.k_shot > 1:  # E.g. for 5-shot scenarios, use 'full' block-diagonal logit matrix to mask entire image
@@ -409,17 +432,17 @@ def metatrain_fewture(args, wandb_run):
         print('\nLoading model file from wandb artifact...')
         artifact = wandb_run.use_artifact('FewTURE/' + args.wandb_mdl_ref, type='model')
         artifact_dir = artifact.download()
-        chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth')
+        chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth', weights_only=False)
         # Adapt and load state dict into current model for evaluation
         chkpt_state_dict = chkpt['teacher']
     elif args.mdl_checkpoint_path:
         print('Loading model from provided path...')
-        chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth')
+        chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth', weights_only=False)
         chkpt_state_dict = chkpt['teacher']
     elif args.mdl_url:
         mdl_storage_path = os.path.join(utils.get_base_path(), 'downloaded_chkpts', f'{args.arch}', f'outdim_{out_dim}')
         download_url(url=args.mdl_url, root=mdl_storage_path, filename=os.path.basename(args.mdl_url))
-        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)))['state_dict']
+        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)), weights_only=False)['state_dict']
     else:
         raise ValueError("Checkpoint not provided or provided one could not be found.")
     # Adapt and load state dict into current model for evaluation
@@ -500,12 +523,71 @@ def metatrain_fewture(args, wandb_run):
 
         for i, batch in enumerate(train_tqdm_gen, 1):
             data, _ = [_.cuda() for _ in batch]
-            # Retrieve the patch embeddings for all samples, both support and query from Transformer backbone
+            # Retrieve patch embeddings (support/query) from backbone
             emb_support, emb_query = get_patch_embeddings(model, data, args)
-            # Run patch-based module, online adaptation using support set info, followed by prediction of query classes
-            query_pred_logits = fsl_mod_inductive(emb_support, emb_support, emb_query, label_support)
 
-            loss = F.cross_entropy(query_pred_logits, label_query)
+            # Build query loss function per args (using uniform counts if none available)
+            class_counts = [args.k_shot for _ in range(args.n_way)] if args.query_loss in ['cb', 'cb_focal'] else None
+            qloss_fn = build_query_loss(
+                loss_name=args.query_loss,
+                num_classes=args.n_way,
+                class_counts=class_counts,
+                beta_cb=args.beta_cb,
+                gamma_focal=args.gamma_focal,
+                alpha_focal=None,
+                label_smoothing=args.label_smoothing,
+            )
+
+            # Optimise PEIV using support, then predict global query logits
+            with torch.enable_grad():
+                fsl_mod_inductive._optimise_peiv(emb_support, emb_support, label_support)
+                query_pred_logits = fsl_mod_inductive._predict(emb_support, emb_query, phase='infer')
+
+            # Optional: attention-based local crops for queries, then merge predictions
+            if args.use_attn_crops:
+                n_total = args.k_shot + args.query
+                B, C, H, W = data.shape
+                images_rs = data.view(args.n_way, n_total, C, H, W)
+                query_images = images_rs[:, args.k_shot:].reshape(-1, C, H, W)
+
+                if 'swin' in args.arch:
+                    heats = []
+                    for chunk in torch.split(query_images, 16):
+                        heat = swin_token_saliency(model, chunk)
+                        heats.append(heat)
+                    heat_q = torch.cat(heats, dim=0)
+                else:
+                    heats = []
+                    for chunk in torch.split(query_images, 16):
+                        heat = vit_attention_rollout(model, chunk, last_k=4, alpha=0.5)
+                        heats.append(heat)
+                    heat_q = torch.cat(heats, dim=0)
+
+                boxes_q = heatmap_to_boxes(heat_q, top_percent=0.07, min_box=8, num_local_crops=args.num_local_crops, iou_thr=0.4)
+                crops_q = extract_crops_from_boxes(query_images, boxes_q, upscale_to=args.crop_size,
+                                                   heatmap_scale=(heat_q.shape[-2], heat_q.shape[-1]))
+                flat_crops = [c for crops in crops_q for c in crops]
+                if len(flat_crops) > 0:
+                    crops_tensor = torch.stack(flat_crops, dim=0).cuda(non_blocking=True)
+                    crop_tokens = model(crops_tensor)[:, 1:]
+                    crop_logits = fsl_mod_inductive._predict(emb_support, crop_tokens, phase='infer')
+                    crop_probs = torch.softmax(crop_logits, dim=-1)
+                    q_counts = [len(c) for c in crops_q]
+                    idx = 0
+                    merged_logits = []
+                    global_probs = torch.softmax(query_pred_logits, dim=-1)
+                    for qi, cnt in enumerate(q_counts):
+                        local_list = []
+                        for _ in range(cnt):
+                            local_list.append(crop_probs[idx])
+                            idx += 1
+                        merged = merge_probs(global_probs[qi], local_list, w_local=args.w_local)
+                        merged_logits.append(torch.log(merged + 1e-8))
+                    if len(merged_logits) > 0:
+                        query_pred_logits = torch.stack(merged_logits, dim=0)
+
+            # Compute episode loss on queries
+            loss = qloss_fn(query_pred_logits, label_query)
             meta_optimiser.zero_grad()
             loss.backward()
             meta_optimiser.step()
@@ -519,12 +601,7 @@ def metatrain_fewture(args, wandb_run):
             train_loss_record[i - 1] = loss
             m_loss, _ = utils.compute_confidence_interval(train_loss_record[:i])
             train_tqdm_gen.set_description(
-                'Ep {} | bt {}/{}: Loss epi:{:.2f} avg: {:.4f} | Acc: epi:{:.2f} avg: {:.4f}+{:.4f}'.format(epoch, i,
-                                                                                                            ttl_num_batches,
-                                                                                                            loss,
-                                                                                                            m_loss,
-                                                                                                            train_acc,
-                                                                                                            m, pm))
+                'Ep {} | bt {}/{}: Loss epi:{:.2f} avg: {:.4f} | Acc: epi:{:.2f} avg: {:.4f}+{:.4f}'.format(epoch, i, ttl_num_batches, loss, m_loss, train_acc, m, pm))
         m, pm = utils.compute_confidence_interval(train_acc_record)
         m_loss, _ = utils.compute_confidence_interval(train_loss_record)
         result_list = ['Ep {} | Overall Train Loss {:.4f} | Train Acc {:.4f}'.format(epoch, train_ave_loss.item(),
@@ -631,6 +708,13 @@ if __name__ == '__main__':
         wandb_run = wandb.init(config=args.__dict__, project="fewture_meta", entity=WANDB_USER)
     else:
         wandb_run = None
+
+    print(args)
+    try:
+        with (Path(args.output_dir) / "args_metra_training.txt").open("w") as f:
+            f.write(json.dumps(args.__dict__, indent=4))
+    except:
+        print("Arguments used during training not available, and will thus not be stored in eval folder.")
 
     # Start meta training
     metatrain_fewture(args, wandb_run)

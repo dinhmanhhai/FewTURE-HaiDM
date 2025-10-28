@@ -165,7 +165,7 @@ def get_args_parser():
 
     # Dataset related parameters
     parser.add_argument('--dataset', default='miniimagenet', type=str,
-                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs'],
+                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs', 'tea_leaves'],
                         help='Please specify the name of the dataset to be used for training.')
     parser.add_argument('--data_path', default=None, type=str,
                         help='Please specify path to the root folder containing the training dataset(s). If dataset '
@@ -548,7 +548,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
 
     pred_labels = torch.cat(pred_labels).cpu().detach().numpy()
     real_labels = torch.cat(real_labels).cpu().detach().numpy()
-    nmi, ari, fscore = utils.eval_pred(real_labels, pred_labels)
+    nmi, ari, fscore, _ = utils.eval_pred(real_labels, pred_labels)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("NMI: {}, ARI: {}, F: {}".format(nmi, ari, fscore))
@@ -732,6 +732,8 @@ def set_up_dataset(args):
         # (Bertinetto et al., 2018) CIFAR-FS (100) -- orig. images 32x32
         # train num_class = 64
         from datasets.dataloaders.cifar_fs.cifar_fs import DatasetLoader as dataset
+    elif args.dataset == 'tea_leaves':
+        from datasets.dataloaders.tea_leaves.tea_leaves import DatasetLoader as dataset
     else:
         raise ValueError('Unknown dataset. Please check your selection!')
     return dataset

@@ -25,6 +25,8 @@ from tqdm import tqdm
 import models
 import utils
 from datasets.samplers import CategoriesSampler
+from utils_pkg.attn_crops import vit_attention_rollout, swin_token_saliency, heatmap_to_boxes, extract_crops_from_boxes, merge_probs
+from utils_pkg.vis import overlay_heatmap, draw_boxes, make_grid, ensure_dir
 
 ####################################################################
 USE_WANDB = False
@@ -64,6 +66,21 @@ def get_args_parser():
                             default is 600 for both 5-shot and 1-shot experiments, but recent works have moved towards
                             increasing this to lower the variance: 600/5k for DeepEMD, 10k/10k for FEAT.""")
 
+    # Attention/Grad-CAM crops
+    parser.add_argument('--use_attn_crops', type=utils.bool_flag, default=False,
+                        help='Enable 2-stage inference: global -> heatmap -> local crops -> merge.')
+    parser.add_argument('--heatmap_method', type=str, default='attn', choices=['attn', 'gradcam'],
+                        help='Heatmap method. Current implementation uses attention rollout for ViT and token saliency for Swin when attn.')
+    parser.add_argument('--num_local_crops', type=int, default=6, help='Number of local crops per query image.')
+    parser.add_argument('--crop_size', type=int, default=320, help='Resize each local crop to this square size.')
+    parser.add_argument('--w_local', type=float, default=0.65, help='Weight for local predictions in merge.')
+    parser.add_argument('--save_visualizations', type=utils.bool_flag, default=False,
+                        help='Save heatmap overlays and crop boxes visualization images.')
+    parser.add_argument('--vis_save_freq', type=int, default=10,
+                        help='Save visualization every N episodes (only for first few episodes by default).')
+    parser.add_argument('--max_vis_episodes', type=int, default=3,
+                        help='Maximum number of episodes to visualize (to avoid storage explosion).')
+
     # FSL adaptation component related parameters
     parser.add_argument('--block_mask_1shot', default=5, type=int, help="""Number of patches to mask around each 
                             respective patch during online-adaptation in 1shot scenarios: masking along main diagonal,
@@ -88,7 +105,7 @@ def get_args_parser():
     parser.add_argument('--image_size', type=int, default=224,
                         help="""Size of the squared input images, 224 for imagenet-style.""")
     parser.add_argument('--dataset', default='miniimagenet', type=str,
-                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs'],
+                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs', 'tea_leaves'],
                         help='Please specify the name of the dataset to be used for training.')
     parser.add_argument('--data_path', required=True, type=str,
                         help='Please specify path to the root folder containing the training dataset(s). If dataset '
@@ -135,6 +152,8 @@ def set_up_dataset(args):
         # (Bertinetto et al., 2018) CIFAR-FS (100) -- orig. images 32x32
         # train num_class = 64
         from datasets.dataloaders.cifar_fs.cifar_fs import DatasetLoader as dataset
+    elif args.dataset == 'tea_leaves':
+        from datasets.dataloaders.tea_leaves.tea_leaves import DatasetLoader as dataset
     else:
         raise ValueError('Unknown dataset. Please check your selection!')
     return dataset
@@ -182,6 +201,7 @@ def compute_emb_cosine_similarity(support_emb: torch.Tensor, query_emb: torch.Te
 class PatchFSL(nn.Module):
     def __init__(self, args, sup_emb_key_seq_len, sup_emb_query_seq_len):
         super(PatchFSL, self).__init__()
+        self.args = args
         self.total_len_support_key = args.n_way * args.k_shot * sup_emb_key_seq_len
         # Mask to prevent image self-classification during adaptation
         if args.k_shot > 1:  # E.g. for 5-shot scenarios, use 'full' block-diagonal logit matrix to mask entire image
@@ -323,11 +343,11 @@ def eval_fewture(args, eval_run=None):
         artifact = eval_run.use_artifact('FewTURE/' + args.wandb_mdl_ref, type='model')
         artifact_dir = artifact.download()
         if args.trained_model_type == 'pretrained':
-            chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth')
+            chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth', weights_only=False)
             # Adapt and load state dict into current model for evaluation
             chkpt_state_dict = chkpt['teacher']
         elif args.trained_model_type == 'metaft':
-            chkpt = torch.load(artifact_dir + f'/meta_best.pth')
+            chkpt = torch.load(artifact_dir + f'/meta_best.pth', weights_only=False)
             # Adapt and load state dict into current model for evaluation
             chkpt_state_dict = chkpt['params']
             try:
@@ -339,10 +359,10 @@ def eval_fewture(args, eval_run=None):
     elif args.mdl_checkpoint_path:
         print('Loading model from provided path...')
         if args.trained_model_type == 'pretrained':
-            chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth')
+            chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth', weights_only=False)
             chkpt_state_dict = chkpt['teacher']
         elif args.trained_model_type == 'metaft':
-            chkpt = torch.load(args.mdl_checkpoint_path + f'/meta_best.pth')
+            chkpt = torch.load(args.mdl_checkpoint_path + f'/meta_best.pth', weights_only=False)
             chkpt_state_dict = chkpt['params']
             try:
                 args.similarity_temp = chkpt['temp_sim']
@@ -353,7 +373,7 @@ def eval_fewture(args, eval_run=None):
     elif args.mdl_url:
         mdl_storage_path = os.path.join(utils.get_base_path(), 'downloaded_chkpts', f'{args.arch}', f'outdim_{out_dim}')
         download_url(url=args.mdl_url, root=mdl_storage_path, filename=os.path.basename(args.mdl_url))
-        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)))['state_dict']
+        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)), weights_only=False)['state_dict']
     else:
         raise ValueError("Checkpoint not provided or provided one could not found.")
     # Adapt and load state dict into current model for evaluation
@@ -404,10 +424,88 @@ def eval_fewture(args, eval_run=None):
             # Retrieve the patch embeddings for all samples, both support and query from our backbone
             emb_support, emb_query = get_patch_embeddings(model, data, args)
 
+            # Build FSL module and optimise peiv on support once
             with torch.enable_grad():
                 fsl_mod_inductive = PatchFSL(args, emb_support.shape[1], emb_support.shape[1])
-                # Patch-based module, online adaptation using support set info, followed by prediction of query classes
-                query_pred_logits = fsl_mod_inductive(emb_support, emb_support, emb_query, label_support)
+                fsl_mod_inductive._optimise_peiv(emb_support, emb_support, label_support)
+                # Predict global query logits
+                query_pred_logits = fsl_mod_inductive._predict(emb_support, emb_query, phase='infer')
+
+            # If enabled, produce local crops for query images and merge predictions
+            if args.use_attn_crops:
+                # Reshape data to [n_way, k_shot+query, C,H,W] and select query images
+                n_total = args.k_shot + args.query
+                B, C, H, W = data.shape
+                images_rs = data.view(args.n_way, n_total, C, H, W)
+                query_images = images_rs[:, args.k_shot:]  # [n_way, query, C,H,W]
+                query_images = query_images.reshape(-1, C, H, W)  # [num_query, C,H,W]
+
+                # Compute heatmaps per query image based on backbone
+                if 'swin' in args.arch:
+                    # Use token saliency as a fast proxy
+                    # model expects full batch; run in chunks to save memory
+                    heats = []
+                    for chunk in torch.split(query_images, 32):
+                        heat = swin_token_saliency(model, chunk)
+                        heats.append(heat)
+                    heat_q = torch.cat(heats, dim=0)  # [Q,1,Hp,Wp]
+                else:
+                    heats = []
+                    for chunk in torch.split(query_images, 32):
+                        heat = vit_attention_rollout(model, chunk, last_k=4, alpha=0.5)
+                        heats.append(heat)
+                    heat_q = torch.cat(heats, dim=0)
+
+                # From heatmaps to boxes (support multi-crop with NMS)
+                boxes_q = heatmap_to_boxes(heat_q, top_percent=0.07, min_box=8, num_local_crops=args.num_local_crops, iou_thr=0.4)
+                crops_q = extract_crops_from_boxes(query_images, boxes_q, upscale_to=args.crop_size,
+                                                   heatmap_scale=(heat_q.shape[-2], heat_q.shape[-1]))
+                
+                # Save visualizations if enabled
+                if args.save_visualizations and i <= args.max_vis_episodes and i % args.vis_save_freq == 0:
+                    import cv2
+                    vis_dir = os.path.join(args.output_dir, 'visualizations')
+                    ensure_dir(vis_dir)
+                    
+                    # Save heatmap overlays and crops for each query image
+                    for q_idx in range(min(query_images.shape[0], 3)):  # Save max 3 per episode
+                        orig_img = query_images[q_idx]  # [C,H,W]
+                        
+                        # Overlay heatmap on original image
+                        overlay = overlay_heatmap(orig_img, heat_q[q_idx], alpha=0.5)
+                        
+                        # Draw crop boxes on original image
+                        img_with_boxes = draw_boxes(orig_img, boxes_q[q_idx], color=(255, 0, 0), thickness=2)
+                        
+                        # Save heatmap overlay
+                        cv2.imwrite(os.path.join(vis_dir, f'ep{i}_query{q_idx}_heatmap.jpg'), overlay)
+                        # Save image with crop boxes
+                        cv2.imwrite(os.path.join(vis_dir, f'ep{i}_query{q_idx}_boxes.jpg'), img_with_boxes)
+                
+                # Flatten all crops
+                flat_crops = [c for crops in crops_q for c in crops]
+                if len(flat_crops) > 0:
+                    crops_tensor = torch.stack(flat_crops, dim=0).cuda(non_blocking=True)
+                    # Get patch embeddings for crops (only query pathway)
+                    crop_tokens = model(crops_tensor)[:, 1:]
+                    # Predict logits for each crop using the already-optimised fsl module
+                    crop_logits = fsl_mod_inductive._predict(emb_support, crop_tokens, phase='infer')  # [num_crops, n_way]
+                    crop_probs = torch.softmax(crop_logits, dim=-1)
+                    # Group crop probs back per original query image
+                    q_counts = [len(c) for c in crops_q]
+                    idx = 0
+                    merged_logits = []
+                    global_probs = torch.softmax(query_pred_logits, dim=-1)
+                    for qi, cnt in enumerate(q_counts):
+                        local_list = []
+                        for _ in range(cnt):
+                            local_list.append(crop_probs[idx])
+                            idx += 1
+                        merged = merge_probs(global_probs[qi], local_list, w_local=args.w_local)
+                        merged_logits.append(torch.log(merged + 1e-8))
+                    if len(merged_logits) > 0:
+                        # Replace query_pred_logits for queries with merged ones
+                        query_pred_logits = torch.stack(merged_logits, dim=0)
 
             acc = utils.count_acc(query_pred_logits, label_query) * 100
             ave_acc.add(acc)
