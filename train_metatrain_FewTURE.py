@@ -26,16 +26,17 @@ from tqdm import tqdm
 import models
 import utils
 from datasets.samplers import CategoriesSampler
-from models.losses import build_query_loss
-from utils_pkg.attn_crops import vit_attention_rollout, swin_token_saliency, heatmap_to_boxes, extract_crops_from_boxes, merge_probs
+from models.heads_cross_attn import CrossAttnHead
+from models.adapt_set2set import SetToSetAdapter
+from utils_pkg.debug_utils import register_debug_hooks, print_all_stats
 
 ####################################################################
-USE_WANDB = False
+USE_WANDB = True
 
 if USE_WANDB:
     import wandb
     # Note: Make sure to specify your username for correct logging
-    WANDB_USER = 'username'
+    WANDB_USER = 'works-haidinh-ptit'
 ####################################################################
 
 
@@ -57,7 +58,6 @@ def get_args_parser():
                             architectures.""")
 
     # FSL task/scenario related parameters
-    
     parser.add_argument('--n_way', type=int, default=5)
     parser.add_argument('--k_shot', type=int, default=5)
     parser.add_argument('--query', type=int, default=15)
@@ -68,21 +68,17 @@ def get_args_parser():
     parser.add_argument('--num_validation_episodes', type=int, default=600,
                         help="""Number of episodes used for validation. """)
 
-    # Attention/Grad-CAM crops (multi-scale) for training
-    parser.add_argument('--use_attn_crops', type=utils.bool_flag, default=False,
-                        help='Enable 2-stage: global -> heatmap -> local crops -> merge for query logits during training.')
-    parser.add_argument('--heatmap_method', type=str, default='attn', choices=['attn', 'gradcam'],
-                        help='Heatmap method. Current implementation uses attention rollout for ViT and token saliency for Swin when attn.')
-    parser.add_argument('--num_local_crops', type=int, default=6, help='Number of local crops per query image.')
-    parser.add_argument('--crop_size', type=int, default=320, help='Resize each local crop to this square size.')
-    parser.add_argument('--w_local', type=float, default=0.65, help='Weight for local predictions in merge.')
-
-    # Query loss options
-    parser.add_argument('--query_loss', type=str, default='ce', choices=['ce', 'focal', 'cb', 'cb_focal'],
-                        help='Loss used on query logits.')
-    parser.add_argument('--beta_cb', type=float, default=0.9995, help='Beta for Class-Balanced.')
-    parser.add_argument('--gamma_focal', type=float, default=2.0, help='Gamma for Focal.')
-    parser.add_argument('--label_smoothing', type=float, default=0.05, help='Label smoothing for CE/CB-CE.')
+    # Heads/adapters (no attention crops; CE only)
+    parser.add_argument('--head_type', type=str, default='cosine', choices=['cosine', 'cross_attn'],
+                        help='Few-shot head to compute query logits.')
+    parser.add_argument('--set2set', type=str, default='feat', choices=['none', 'feat'],
+                        help='Set-to-set adaptation (FEAT-style).')
+    parser.add_argument('--attn_heads', type=int, default=8, help='Num attention heads for cross-attn/set2set.')
+    parser.add_argument('--attn_layers', type=int, default=1, help='Num transformer layers for set2set.')
+    parser.add_argument('--attn_dropout', type=float, default=0.0, help='Dropout for attention modules.')
+    parser.add_argument('--debug_attn', type=utils.bool_flag, default=True, help='Debug attention input/output.')
+    parser.add_argument('--debug_grad', type=utils.bool_flag, default=True, help='Debug gradients (vanishing detection).')
+    parser.add_argument('--debug_freq', type=int, default=10, help='Print debug stats every N steps.')
 
     # Optimisation outer loop -- meta fine-tuning
     parser.add_argument('--meta_lr', type=float, default=0.0002,
@@ -172,8 +168,6 @@ def set_up_dataset(args):
         # (Bertinetto et al., 2018) CIFAR-FS (100) -- orig. images 32x32
         # train num_class = 64
         from datasets.dataloaders.cifar_fs.cifar_fs import DatasetLoader as dataset
-    elif args.dataset == 'tea_leaves':
-        from datasets.dataloaders.tea_leaves.tea_leaves import DatasetLoader as dataset
     else:
         raise ValueError('Unknown dataset. Please check your selection!')
     return dataset
@@ -246,17 +240,35 @@ def run_validation(model, patchfsl, data_loader, args, epoch):
     val_tqdm_gen = tqdm(data_loader)
     # Run validation
     with torch.no_grad():
+        cross_head = None
+        set2set_adapter = None
         for i, batch in enumerate(val_tqdm_gen, 1):
             data, _ = [_.cuda() for _ in batch]
             # Retrieve the patch embeddings for all samples, both support and query from Transformer backbone
             emb_support, emb_query = get_patch_embeddings(model, data, args)
 
-            with torch.enable_grad():
-                # optimise patch importance weights based on support set information and predict query logits
-                query_pred_logits = patchfsl(emb_support, emb_support, emb_query, label_support)
+            # Optional set-to-set adaptation
+            if args.set2set == 'feat':
+                if set2set_adapter is None:
+                    set2set_adapter = SetToSetAdapter(
+                        d_model=emb_query.shape[-1],
+                        n_layers=args.attn_layers,
+                        n_heads=args.attn_heads,
+                        dropout=args.attn_dropout,
+                    ).cuda()
+                emb_support, emb_query = set2set_adapter(emb_support, emb_query)
 
-            # Compute validation loss (CE with optional smoothing)
-            loss = F.cross_entropy(query_pred_logits, label_query, label_smoothing=args.label_smoothing)
+            # Predict logits depending on head type
+            if args.head_type == 'cross_attn':
+                if cross_head is None:
+                    cross_head = CrossAttnHead(n_heads=args.attn_heads, dropout=args.attn_dropout).cuda()
+                query_pred_logits = cross_head(emb_support, emb_query, label_support, args.n_way)
+            else:
+                # PatchFSL forward thực hiện tối ưu PEIV và cần gradient ngay cả trong validation
+                with torch.enable_grad():
+                    query_pred_logits = patchfsl(emb_support, emb_support, emb_query, label_support)
+
+            loss = F.cross_entropy(query_pred_logits, label_query)
 
             val_acc = utils.count_acc(query_pred_logits, label_query) * 100
             val_ave_acc.add(val_acc)
@@ -283,7 +295,6 @@ def run_validation(model, patchfsl, data_loader, args, epoch):
 class PatchFSL(nn.Module):
     def __init__(self, args, sup_emb_key_seq_len, sup_emb_query_seq_len):
         super(PatchFSL, self).__init__()
-        self.args = args
         self.total_len_support_key = args.n_way * args.k_shot * sup_emb_key_seq_len
         # Mask to prevent image self-classification during adaptation
         if args.k_shot > 1:  # E.g. for 5-shot scenarios, use 'full' block-diagonal logit matrix to mask entire image
@@ -521,75 +532,82 @@ def metatrain_fewture(args, wandb_run):
         train_loss_record = np.zeros((args.num_episodes_per_epoch,))
         ttl_num_batches = len(train_tqdm_gen)
 
+        cross_head = None
+        set2set_adapter = None
+        cross_head_added = False
+        set2set_added = False
+        attn_hooks = {}
+        grad_hooks = {}
+        debug_handles = []
         for i, batch in enumerate(train_tqdm_gen, 1):
             data, _ = [_.cuda() for _ in batch]
-            # Retrieve patch embeddings (support/query) from backbone
+            # Retrieve the patch embeddings for all samples, both support and query from Transformer backbone
             emb_support, emb_query = get_patch_embeddings(model, data, args)
-
-            # Build query loss function per args (using uniform counts if none available)
-            class_counts = [args.k_shot for _ in range(args.n_way)] if args.query_loss in ['cb', 'cb_focal'] else None
-            qloss_fn = build_query_loss(
-                loss_name=args.query_loss,
-                num_classes=args.n_way,
-                class_counts=class_counts,
-                beta_cb=args.beta_cb,
-                gamma_focal=args.gamma_focal,
-                alpha_focal=None,
-                label_smoothing=args.label_smoothing,
-            )
-
-            # Optimise PEIV using support, then predict global query logits
-            with torch.enable_grad():
+            # Optional set-to-set adaptation (global only)
+            if args.set2set == 'feat':
+                if set2set_adapter is None:
+                    set2set_adapter = SetToSetAdapter(
+                        d_model=emb_query.shape[-1],
+                        n_layers=args.attn_layers,
+                        n_heads=args.attn_heads,
+                        dropout=args.attn_dropout,
+                    ).cuda()
+                    if not set2set_added:
+                        meta_optimiser.add_param_group({'params': set2set_adapter.parameters(), 'lr': args.meta_lr})
+                        set2set_added = True
+                    # Register debug hooks for set2set
+                    if args.debug_attn:
+                        from utils_pkg.debug_utils import AttentionDebugHook
+                        hook_enc = AttentionDebugHook(module_name="set2set_encoder")
+                        hook_cross = AttentionDebugHook(module_name="set2set_cross")
+                        h1 = hook_enc.register(set2set_adapter.encoder.layers[0].self_attn)
+                        h2 = hook_cross.register(set2set_adapter.cross)
+                        debug_handles.extend([h1, h2])
+                        attn_hooks["set2set_encoder"] = hook_enc
+                        attn_hooks["set2set_cross"] = hook_cross
+                emb_support, emb_query = set2set_adapter(emb_support, emb_query)
+            # Run patch-based module, online adaptation using support set info, followed by prediction of query classes
+            if args.head_type == 'cross_attn':
+                # vẫn tối ưu PEIV để tương thích pipeline gốc
                 fsl_mod_inductive._optimise_peiv(emb_support, emb_support, label_support)
-                query_pred_logits = fsl_mod_inductive._predict(emb_support, emb_query, phase='infer')
+                if cross_head is None:
+                    cross_head = CrossAttnHead(n_heads=args.attn_heads, dropout=args.attn_dropout).cuda()
+                    if not cross_head_added:
+                        meta_optimiser.add_param_group({'params': cross_head.parameters(), 'lr': args.meta_lr})
+                        cross_head_added = True
+                query_pred_logits = cross_head(emb_support, emb_query, label_support, args.n_way)
+                # Register debug hooks after first forward (mha is now initialized)
+                if args.debug_attn and cross_head.mha is not None and "cross_attn_head" not in attn_hooks:
+                    from utils_pkg.debug_utils import AttentionDebugHook
+                    hook = AttentionDebugHook(module_name="cross_attn_head")
+                    h = hook.register(cross_head.mha)
+                    debug_handles.append(h)
+                    attn_hooks["cross_attn_head"] = hook
+            else:
+                query_pred_logits = fsl_mod_inductive(emb_support, emb_support, emb_query, label_support)
 
-            # Optional: attention-based local crops for queries, then merge predictions
-            if args.use_attn_crops:
-                n_total = args.k_shot + args.query
-                B, C, H, W = data.shape
-                images_rs = data.view(args.n_way, n_total, C, H, W)
-                query_images = images_rs[:, args.k_shot:].reshape(-1, C, H, W)
-
-                if 'swin' in args.arch:
-                    heats = []
-                    for chunk in torch.split(query_images, 16):
-                        heat = swin_token_saliency(model, chunk)
-                        heats.append(heat)
-                    heat_q = torch.cat(heats, dim=0)
-                else:
-                    heats = []
-                    for chunk in torch.split(query_images, 16):
-                        heat = vit_attention_rollout(model, chunk, last_k=4, alpha=0.5)
-                        heats.append(heat)
-                    heat_q = torch.cat(heats, dim=0)
-
-                boxes_q = heatmap_to_boxes(heat_q, top_percent=0.07, min_box=8, num_local_crops=args.num_local_crops, iou_thr=0.4)
-                crops_q = extract_crops_from_boxes(query_images, boxes_q, upscale_to=args.crop_size,
-                                                   heatmap_scale=(heat_q.shape[-2], heat_q.shape[-1]))
-                flat_crops = [c for crops in crops_q for c in crops]
-                if len(flat_crops) > 0:
-                    crops_tensor = torch.stack(flat_crops, dim=0).cuda(non_blocking=True)
-                    crop_tokens = model(crops_tensor)[:, 1:]
-                    crop_logits = fsl_mod_inductive._predict(emb_support, crop_tokens, phase='infer')
-                    crop_probs = torch.softmax(crop_logits, dim=-1)
-                    q_counts = [len(c) for c in crops_q]
-                    idx = 0
-                    merged_logits = []
-                    global_probs = torch.softmax(query_pred_logits, dim=-1)
-                    for qi, cnt in enumerate(q_counts):
-                        local_list = []
-                        for _ in range(cnt):
-                            local_list.append(crop_probs[idx])
-                            idx += 1
-                        merged = merge_probs(global_probs[qi], local_list, w_local=args.w_local)
-                        merged_logits.append(torch.log(merged + 1e-8))
-                    if len(merged_logits) > 0:
-                        query_pred_logits = torch.stack(merged_logits, dim=0)
-
-            # Compute episode loss on queries
-            loss = qloss_fn(query_pred_logits, label_query)
+            loss = F.cross_entropy(query_pred_logits, label_query)
             meta_optimiser.zero_grad()
+            # Register gradient hooks if needed (first batch only)
+            if args.debug_grad and i == 1:
+                from utils_pkg.debug_utils import GradientDebugHook
+                # Hook cho cross_head
+                if cross_head is not None:
+                    gh = GradientDebugHook(module_name="cross_head")
+                    handles = gh.register(cross_head)
+                    debug_handles.extend(handles)
+                    grad_hooks["cross_head"] = gh
+                # Hook cho set2set_adapter
+                if set2set_adapter is not None:
+                    gh = GradientDebugHook(module_name="set2set_adapter")
+                    handles = gh.register(set2set_adapter)
+                    debug_handles.extend(handles)
+                    grad_hooks["set2set_adapter"] = gh
             loss.backward()
+            # Print debug stats periodically
+            if (args.debug_attn or args.debug_grad) and (i % args.debug_freq == 0):
+                step = (epoch - 1) * args.num_episodes_per_epoch + i
+                print_all_stats(attn_hooks, grad_hooks, step=step)
             meta_optimiser.step()
             meta_lr_scheduler.step()
 
@@ -601,7 +619,12 @@ def metatrain_fewture(args, wandb_run):
             train_loss_record[i - 1] = loss
             m_loss, _ = utils.compute_confidence_interval(train_loss_record[:i])
             train_tqdm_gen.set_description(
-                'Ep {} | bt {}/{}: Loss epi:{:.2f} avg: {:.4f} | Acc: epi:{:.2f} avg: {:.4f}+{:.4f}'.format(epoch, i, ttl_num_batches, loss, m_loss, train_acc, m, pm))
+                'Ep {} | bt {}/{}: Loss epi:{:.2f} avg: {:.4f} | Acc: epi:{:.2f} avg: {:.4f}+{:.4f}'.format(epoch, i,
+                                                                                                            ttl_num_batches,
+                                                                                                            loss,
+                                                                                                            m_loss,
+                                                                                                            train_acc,
+                                                                                                            m, pm))
         m, pm = utils.compute_confidence_interval(train_acc_record)
         m_loss, _ = utils.compute_confidence_interval(train_loss_record)
         result_list = ['Ep {} | Overall Train Loss {:.4f} | Train Acc {:.4f}'.format(epoch, train_ave_loss.item(),
@@ -612,6 +635,11 @@ def metatrain_fewture(args, wandb_run):
             print(f'Ep {epoch} | Temperature {np.exp(fsl_mod_inductive.log_tau_c.item()):.4f}')
         else:
             print(f'Ep {epoch} | Using fixed temperature {np.exp(fsl_mod_inductive.log_tau_c.item()):.4f}')
+
+        # Cleanup debug hooks (remove to avoid memory leak)
+        for handle in debug_handles:
+            handle.remove()
+        debug_handles = []
 
         # Log stats to wandb
         if args.use_wandb:
@@ -715,7 +743,7 @@ if __name__ == '__main__':
             f.write(json.dumps(args.__dict__, indent=4))
     except:
         print("Arguments used during training not available, and will thus not be stored in eval folder.")
-
+        
     # Start meta training
     metatrain_fewture(args, wandb_run)
 

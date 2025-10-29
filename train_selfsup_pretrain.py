@@ -40,12 +40,12 @@ from models.head import iBOTHead
 from loader import DatasetMask
 
 ####################################################################
-USE_WANDB = False
+USE_WANDB = True
 
 if USE_WANDB:
     import wandb
     # Note: Make sure to specify your username for correct logging
-    WANDB_USER = 'username'
+    WANDB_USER = 'works-haidinh-ptit'
 ####################################################################
 
 
