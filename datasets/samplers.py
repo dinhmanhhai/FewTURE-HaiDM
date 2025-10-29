@@ -39,7 +39,15 @@ class CategoriesSampler():
             classes = torch.randperm(len(self.m_ind))[:self.n_cls]  # random sample num_class indexes,e.g. 5
             for c in classes:
                 l = self.m_ind[c]  # all data indexs of this class
-                pos = torch.randperm(len(l))[:self.n_per]  # sample n_per data index of this class
+                # Fix: Check if class has enough samples
+                if len(l) < self.n_per:
+                    # If not enough samples, repeat existing samples
+                    pos = torch.randperm(len(l))
+                    # Repeat indices to reach n_per
+                    repeat_times = (self.n_per // len(l)) + 1
+                    pos = pos.repeat(repeat_times)[:self.n_per]
+                else:
+                    pos = torch.randperm(len(l))[:self.n_per]  # sample n_per data index of this class
                 batch.append(l[pos])
             batch = torch.stack(batch).reshape(-1)
             # no .t() transpose (in contrast to 'permuted' sampler),
