@@ -1,14 +1,3 @@
-# Copyright (c) Markus Hiller and Rongkai Ma -- 2022
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-#
-"""
-Dataloader build upon the DeepEMD repository, available under https://github.com/icoz69/DeepEMD/tree/master/Models/dataloader
-"""
-#
-#
 import os
 import os.path as osp
 
@@ -20,7 +9,7 @@ from torchvision import transforms
 class DatasetLoader(Dataset):
 
     def __init__(self, setname, args, train_augmentation=None):
-        DATASET_DIR = os.path.join(args.data_path, 'FC100/')
+        DATASET_DIR = os.path.join(args.data_path, 'tea_leaves/')
         if setname == 'train':
             THE_PATH = osp.join(DATASET_DIR, 'train')
             label_list = os.listdir(THE_PATH)
@@ -41,8 +30,9 @@ class DatasetLoader(Dataset):
         for idx, this_folder in enumerate(folders):
             this_folder_images = os.listdir(this_folder)
             for image_path in this_folder_images:
-                data.append(osp.join(this_folder, image_path))
-                label.append(idx)
+                if image_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    data.append(osp.join(this_folder, image_path))
+                    label.append(idx)
 
         self.data = data
         self.label = label
@@ -53,11 +43,11 @@ class DatasetLoader(Dataset):
             if train_augmentation is not None:
                 self.transform = train_augmentation
             else:
-                # Default train transform if no augmentation provided
                 image_size = args.image_size
                 self.transform = transforms.Compose([
                     transforms.RandomResizedCrop(image_size),
                     transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                     transforms.ToTensor(),
                     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
                 ])
@@ -74,9 +64,7 @@ class DatasetLoader(Dataset):
                 transforms.Resize([img_resize, img_resize]),
                 transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
-                # transforms.Normalize(np.array([x / 255.0 for x in [125.3, 123.0, 113.9]]),
-                #                      np.array([x / 255.0 for x in [63.0, 62.1, 66.7]]))
-                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))  # ImageNet standard
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
             ])
         else:
             ValueError("Set name or train augmentation corrupt. Please check!")
@@ -90,5 +78,3 @@ class DatasetLoader(Dataset):
         return image, label
 
 
-if __name__ == '__main__':
-    pass
