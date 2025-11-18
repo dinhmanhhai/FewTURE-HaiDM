@@ -27,12 +27,12 @@ import utils
 from datasets.samplers import CategoriesSampler
 
 ####################################################################
-USE_WANDB = False
+USE_WANDB = True
 
 if USE_WANDB:
     import wandb
     # Note: Make sure to specify your username for correct logging
-    WANDB_USER = 'username'
+    WANDB_USER = 'works-haidinh-ptit'
 ####################################################################
 
 
@@ -323,11 +323,11 @@ def eval_fewture(args, eval_run=None):
         artifact = eval_run.use_artifact('FewTURE/' + args.wandb_mdl_ref, type='model')
         artifact_dir = artifact.download()
         if args.trained_model_type == 'pretrained':
-            chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth')
+            chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth', weights_only=False)
             # Adapt and load state dict into current model for evaluation
             chkpt_state_dict = chkpt['teacher']
         elif args.trained_model_type == 'metaft':
-            chkpt = torch.load(artifact_dir + f'/meta_best.pth')
+            chkpt = torch.load(artifact_dir + f'/meta_best.pth', weights_only=False)
             # Adapt and load state dict into current model for evaluation
             chkpt_state_dict = chkpt['params']
             try:
@@ -339,10 +339,10 @@ def eval_fewture(args, eval_run=None):
     elif args.mdl_checkpoint_path:
         print('Loading model from provided path...')
         if args.trained_model_type == 'pretrained':
-            chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth')
+            chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth', weights_only=False)
             chkpt_state_dict = chkpt['teacher']
         elif args.trained_model_type == 'metaft':
-            chkpt = torch.load(args.mdl_checkpoint_path + f'/meta_best.pth')
+            chkpt = torch.load(args.mdl_checkpoint_path + f'/meta_best.pth', weights_only=False)
             chkpt_state_dict = chkpt['params']
             try:
                 args.similarity_temp = chkpt['temp_sim']
@@ -353,7 +353,7 @@ def eval_fewture(args, eval_run=None):
     elif args.mdl_url:
         mdl_storage_path = os.path.join(utils.get_base_path(), 'downloaded_chkpts', f'{args.arch}', f'outdim_{out_dim}')
         download_url(url=args.mdl_url, root=mdl_storage_path, filename=os.path.basename(args.mdl_url))
-        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)))['state_dict']
+        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)), weights_only=False)['state_dict']
     else:
         raise ValueError("Checkpoint not provided or provided one could not found.")
     # Adapt and load state dict into current model for evaluation

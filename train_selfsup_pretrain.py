@@ -40,12 +40,12 @@ from models.head import iBOTHead
 from loader import DatasetMask
 
 ####################################################################
-USE_WANDB = False
+USE_WANDB = True
 
 if USE_WANDB:
     import wandb
     # Note: Make sure to specify your username for correct logging
-    WANDB_USER = 'username'
+    WANDB_USER = 'works-haidinh-ptit'
 ####################################################################
 
 
@@ -439,7 +439,7 @@ def pretrain_fewture(args):
         except:
             print("Training had already finished for specified number of epochs. "
                   "Loading most-recent model from disk and uploading model to wandb.")
-            mdl_final = torch.load(os.path.join(args.output_dir, f'checkpoint.pth'))
+            mdl_final = torch.load(os.path.join(args.output_dir, f'checkpoint.pth'), weights_only=False)
             ep = mdl_final['epoch']
             with mdl_art.new_file(f'checkpoint_ep{ep}.pth', 'wb') as file:
                 torch.save(mdl_final, file)

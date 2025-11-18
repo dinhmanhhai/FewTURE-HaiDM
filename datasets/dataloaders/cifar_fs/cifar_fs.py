@@ -54,25 +54,24 @@ class DatasetLoader(Dataset):
         self.num_class = len(set(label))
 
         # Transformation
-        if setname == 'train' and train_augmentation is not None:
-            self.transform = train_augmentation
-
-        elif (setname == 'val' or setname == 'test') and train_augmentation is None:
+        if (setname == 'val' or setname == 'test' or setname == 'train') and train_augmentation is None:
             image_size = args.image_size
             if image_size == 224:
                 img_resize = 256
             elif image_size == 84:
                 img_resize = 92
             else:
-                ValueError('Image size not supported at the moment.')
+                raise ValueError('Image size not supported at the moment.')
             self.transform = transforms.Compose([
                 transforms.Resize([img_resize, img_resize]),
                 transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
                 transforms.Normalize((0.5071, 0.4866, 0.4409), (0.2009, 0.1984, 0.2023)) # Differs from ImageNet standard!
             ])
+        elif setname == 'train' and train_augmentation is not None:
+            self.transform = train_augmentation
         else:
-            ValueError("Set name or train augmentation corrupt. Please check!")
+            raise ValueError("Set name or train augmentation corrupt. Please check!")
 
     def __len__(self):
         return len(self.data)

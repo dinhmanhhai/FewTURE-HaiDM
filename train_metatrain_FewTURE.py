@@ -26,14 +26,15 @@ from tqdm import tqdm
 import models
 import utils
 from datasets.samplers import CategoriesSampler
+from models.reconstruction import DualReconstruction
 
 ####################################################################
-USE_WANDB = False
+USE_WANDB = True
 
 if USE_WANDB:
     import wandb
     # Note: Make sure to specify your username for correct logging
-    WANDB_USER = 'username'
+    WANDB_USER = 'works-haidinh-ptit'
 ####################################################################
 
 
@@ -126,6 +127,28 @@ def get_args_parser():
     parser.add_argument('--chkpt_epoch', default=799, type=int, help="""Number of epochs of pretrained 
                             model to be loaded for evaluation.""")
 
+    # Multi-Attention Architecture parameters
+    parser.add_argument('--use_mab', type=utils.bool_flag, default=True,
+                        help="""Use Mixed Attention Block (MAB) instead of standard attention.""")
+    parser.add_argument('--use_ocab', type=utils.bool_flag, default=True,
+                        help="""Use Overlapping Cross-Attention Block (OCAB) instead of standard attention.""")
+    parser.add_argument('--use_drff', type=utils.bool_flag, default=True,
+                        help="""Use Dual Reconstruction Feature Fusion (DRFF) module.""")
+    parser.add_argument('--drff_num_scales', type=int, default=3,
+                        help="""Number of scales for DRFF multi-scale feature extraction.""")
+    
+    # Dual Reconstruction parameters
+    parser.add_argument('--use_reconstruction', type=utils.bool_flag, default=True,
+                        help="""Enable Dual Reconstruction module for few-shot learning.""")
+    parser.add_argument('--lambda_q', type=float, default=1.0,
+                        help="""Weight for query reconstruction loss.""")
+    parser.add_argument('--lambda_s', type=float, default=1.0,
+                        help="""Weight for support reconstruction loss.""")
+    parser.add_argument('--lambda_sim', type=float, default=0.5,
+                        help="""Weight for similarity combination in classification.""")
+    parser.add_argument('--reconstruction_weight', type=float, default=0.1,
+                        help="""Weight for reconstruction loss in total loss.""")
+    
     # Misc
     parser.add_argument('--output_dir', default="", type=str, help="""Root path where to save correspondence images. 
                             If left empty, results will be stored in './meta_fewture/...'.""")
@@ -158,13 +181,16 @@ def set_up_dataset(args):
     return dataset
 
 
-def get_patch_embeddings(model, data, args):
+def get_patch_embeddings(model, data, args, use_drff=False):
     """Function to retrieve all patch embeddings of provided data samples, split into support and query set samples;
     Data arranged in 'aaabbbcccdddeee' fashion, so must be split appropriately for support and query set"""
     # Forward pass through backbone model;
     # Important: This contains the [cls] token at position 0 ([:,0]) and the patch-embeddings after that([:,1:end]).
     # We thus remove the [cls] token
-    patch_embeddings = model(data)[:, 1:]
+    if use_drff and hasattr(model, 'use_drff') and model.use_drff:
+        patch_embeddings = model(data, return_features=True)[:, 1:]
+    else:
+        patch_embeddings = model(data)[:, 1:]
     # temp size values for reshaping
     bs, seq_len, emb_dim = patch_embeddings.shape[0], patch_embeddings.shape[1], patch_embeddings.shape[2]
     # Split the data accordingly into support set and query set!  E.g. 5|75 (5way,1-shot); 25|75 (5way, 5-shot)
@@ -198,7 +224,7 @@ def compute_emb_cosine_similarity(support_emb: torch.Tensor, query_emb: torch.Te
 
 
 def get_sup_emb_seqlengths(args):
-    if args.arch in ['vit_tiny', 'vit_small', 'deit_tiny', 'deit_small']:
+    if args.arch in ['vit_tiny', 'vit_small', 'deit_tiny', 'deit_small', 'vit_tiny_mra', 'vit_small_mra']:
         raw_emb_len = (args.image_size // args.patch_size) ** 2
         support_key_seqlen = raw_emb_len
         support_query_seqlen = raw_emb_len
@@ -228,7 +254,8 @@ def run_validation(model, patchfsl, data_loader, args, epoch):
         for i, batch in enumerate(val_tqdm_gen, 1):
             data, _ = [_.cuda() for _ in batch]
             # Retrieve the patch embeddings for all samples, both support and query from Transformer backbone
-            emb_support, emb_query = get_patch_embeddings(model, data, args)
+            use_drff = getattr(args, 'use_drff', False) or (hasattr(model, 'use_drff') and model.use_drff)
+            emb_support, emb_query = get_patch_embeddings(model, data, args, use_drff=use_drff)
 
             with torch.enable_grad():
                 # optimise patch importance weights based on support set information and predict query logits
@@ -390,10 +417,25 @@ def metatrain_fewture(args, wandb_run):
         )
     # if the network is a vision transformer (i.e. vit_tiny, vit_small, ...)
     elif args.arch in models.__dict__.keys():
-        model = models.__dict__[args.arch](
-            patch_size=args.patch_size,
-            return_all_tokens=True
-        )
+        # Check if we should use models_copy with multi-attention
+        use_multi_attention = args.use_mab or args.use_ocab or args.use_drff
+        if use_multi_attention and args.arch in models.__dict__.keys():
+            # Use models_copy with multi-attention architecture
+            model = models.__dict__[args.arch](
+                patch_size=args.patch_size,
+                return_all_tokens=True,
+                use_mab=args.use_mab,
+                use_ocab=args.use_ocab,
+                window_size=getattr(args, 'window_size', 7),
+                use_drff=args.use_drff,
+                drff_num_scales=args.drff_num_scales
+            )
+        else:
+            # Use standard model
+            model = models.__dict__[args.arch](
+                patch_size=args.patch_size,
+                return_all_tokens=True
+            )
     else:
         raise ValueError(f"Unknown architecture: {args.arch}. Please choose one that is supported.")
 
@@ -409,17 +451,17 @@ def metatrain_fewture(args, wandb_run):
         print('\nLoading model file from wandb artifact...')
         artifact = wandb_run.use_artifact('FewTURE/' + args.wandb_mdl_ref, type='model')
         artifact_dir = artifact.download()
-        chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth')
+        chkpt = torch.load(artifact_dir + f'/checkpoint_ep{args.chkpt_epoch}.pth', weights_only=False)
         # Adapt and load state dict into current model for evaluation
         chkpt_state_dict = chkpt['teacher']
     elif args.mdl_checkpoint_path:
         print('Loading model from provided path...')
-        chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth')
+        chkpt = torch.load(args.mdl_checkpoint_path + f'/checkpoint{args.chkpt_epoch:04d}.pth', weights_only=False)
         chkpt_state_dict = chkpt['teacher']
     elif args.mdl_url:
         mdl_storage_path = os.path.join(utils.get_base_path(), 'downloaded_chkpts', f'{args.arch}', f'outdim_{out_dim}')
         download_url(url=args.mdl_url, root=mdl_storage_path, filename=os.path.basename(args.mdl_url))
-        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)))['state_dict']
+        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)), weights_only=False)['state_dict']
     else:
         raise ValueError("Checkpoint not provided or provided one could not be found.")
     # Adapt and load state dict into current model for evaluation
@@ -446,6 +488,18 @@ def metatrain_fewture(args, wandb_run):
     # ============= Building the patchFSL online adaptation and classification module =================================
     seqlen_key, seqlen_qu = get_sup_emb_seqlengths(args)
     fsl_mod_inductive = PatchFSL(args, seqlen_key, seqlen_qu)
+    
+    # ============= Building the Dual Reconstruction module =================================
+    use_reconstruction = getattr(args, 'use_reconstruction', False)
+    if use_reconstruction:
+        lambda_q = getattr(args, 'lambda_q', 1.0)
+        lambda_s = getattr(args, 'lambda_s', 1.0)
+        lambda_sim = getattr(args, 'lambda_sim', 0.5)
+        reconstruction_module = DualReconstruction(lambda_q=lambda_q, lambda_s=lambda_s, lambda_sim=lambda_sim).cuda()
+        reconstruction_weight = getattr(args, 'reconstruction_weight', 0.1)
+    else:
+        reconstruction_module = None
+        reconstruction_weight = 0.0
 
     # ============= Building the optimiser for meta fine-tuning and assigning the parameters ==========================
     param_to_meta_learn = [{'params': model.parameters()}]
@@ -501,11 +555,43 @@ def metatrain_fewture(args, wandb_run):
         for i, batch in enumerate(train_tqdm_gen, 1):
             data, _ = [_.cuda() for _ in batch]
             # Retrieve the patch embeddings for all samples, both support and query from Transformer backbone
-            emb_support, emb_query = get_patch_embeddings(model, data, args)
+            use_drff = getattr(args, 'use_drff', False) or (hasattr(model, 'use_drff') and model.use_drff)
+            emb_support, emb_query = get_patch_embeddings(model, data, args, use_drff=use_drff)
+            
+            # Dual Reconstruction if enabled
+            reconstruction_loss = torch.tensor(0.0, device=data.device)
+            if use_reconstruction and reconstruction_module is not None:
+                # Group support features by class for reconstruction
+                # emb_support: (n_way * k_shot, seq_len, emb_dim)
+                # emb_query: (n_way * query, seq_len, emb_dim)
+                n_way = args.n_way
+                k_shot = args.k_shot
+                query = args.query
+                
+                # Reshape to group by class
+                support_by_class = emb_support.view(n_way, k_shot, -1, emb_support.shape[-1])  # (n_way, k_shot, seq_len, emb_dim)
+                query_by_class = emb_query.view(n_way, query, -1, emb_query.shape[-1])  # (n_way, query, seq_len, emb_dim)
+                
+                # Perform reconstruction for each class
+                total_recon_loss = 0.0
+                for c in range(n_way):
+                    # Get support and query for this class
+                    class_support = support_by_class[c]  # (k_shot, seq_len, emb_dim)
+                    class_query = query_by_class[c]  # (query, seq_len, emb_dim)
+                    
+                    # Reconstruct
+                    recon_results = reconstruction_module(class_query, class_support)
+                    total_recon_loss += recon_results['total_reconstruction_loss']
+                
+                reconstruction_loss = total_recon_loss / n_way
+            
             # Run patch-based module, online adaptation using support set info, followed by prediction of query classes
             query_pred_logits = fsl_mod_inductive(emb_support, emb_support, emb_query, label_support)
 
-            loss = F.cross_entropy(query_pred_logits, label_query)
+            # Combined loss: classification + reconstruction
+            classification_loss = F.cross_entropy(query_pred_logits, label_query)
+            loss = classification_loss + reconstruction_weight * reconstruction_loss
+            
             meta_optimiser.zero_grad()
             loss.backward()
             meta_optimiser.step()
@@ -574,7 +660,7 @@ def metatrain_fewture(args, wandb_run):
         except:
             pass
         # Load best validation checkpoint (previously stored to disk)
-        mdl_final = torch.load(os.path.join(args.output_dir, 'meta_best.pth'))
+        mdl_final = torch.load(os.path.join(args.output_dir, 'meta_best.pth'), weights_only=False)
         with mdl_art.new_file(f'meta_best.pth', 'wb') as file:
             torch.save(mdl_final, file)
         with mdl_art.new_file('accuracy.txt', 'w') as file:
