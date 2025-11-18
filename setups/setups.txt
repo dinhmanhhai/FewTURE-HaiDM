@@ -1,0 +1,36 @@
+# export WANDB_API_KEY="654322757bc621b514dc2592badff0c6eeefe6ad"
+
+##################################################################
+
+# Tea_Leaf_Disease
+# gdown --fuzzy "https://drive.google.com/uc?id=1U2YAuqXghl_Lfuo3YD2QLtqQ7xyPsBek" -O tea_leaves.zip
+
+
+# tea leaves
+# gdown --fuzzy "https://drive.google.com/uc?id=1d14ZujYYzomZLHOznf6RenGGmRiGZK-6" -O tea_leaves.rar
+# unrar x tea_leaves.rar
+# mv tea_diseases_split tea_leaves
+
+##################################################################
+
+# Cifar vit small
+# gdown --fuzzy "https://drive.google.com/uc?id=1Qqk3nECzdXVHbkq2pGucKZd_Jh_4TFBT" -O checkpoit1600.pth
+
+# Cifar swin tiny
+# gdown --fuzzy "https://drive.google.com/uc?id=1MQpk_CQLS0jRIZp47w4IyYC2lWTqftcr" -O checkpoint800.pth
+
+##################################################################
+
+# FC100 vit small
+# gdown --fuzzy "https://drive.google.com/uc?id=1CCr0QVT79qYGVxWgMLJOOQ5xOfMZfOPH" -O checkpoint1600.pth
+
+# FC100 swin tiny
+# gdown --fuzzy "https://drive.google.com/uc?id=19p-hxFrfhrAbMWHZN0mfVwYXmdfMucyQ" -O checkpoint800.pth
+
+##################################################################
+
+# miniimagenet swin tiny
+# gdown --fuzzy "https://drive.google.com/uc?id=1iWeDYLKfVSd06OMmaTYfhKAoV4lNuizB" -O miniimagenet_swin_tiny.pth
+
+##################################################################
+

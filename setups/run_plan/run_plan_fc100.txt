@@ -1,0 +1,42 @@
+export WANDB_API_KEY="654322757bc621b514dc2592badff0c6eeefe6ad"
+
+1. FC100
+1.1. default
+
+python train_metatrain_FewTURE.py \
+    --arch vit_small \
+    --patch_size 16 \
+    --num_epochs 100 \
+    --num_episodes_per_epoch 100 \
+    --data_path /home/haidm/Desktop/mount/FewTURE/datasets \
+    --n_way 5 \
+    --k_shot 1 \
+    --num_validation_episodes 300 \
+    --dataset fc100 \
+    --chkpt_epoch 1600 \
+    --num_workers 8 \
+    --mdl_checkpoint_path /home/haidm/Desktop/mount/FewTURE/models_copy
+
+
+python eval_FewTURE.py \
+    --data_path /workspace/work1/FewTURE/datasets/ \
+    --arch vit_small \
+    --n_way 5 \
+    --k_shot 1 \
+    --trained_model_type metaft \
+    --optim_steps_online 15 \
+    --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/fc100_224/vit_small/ep_1601/bs_/outdim_/5736ea392dc7c85c1c54be44d753c100 \
+    --dataset fc100
+
+
+
+python eval_FewTURE.py \
+    --data_path /workspace/work1/FewTURE/datasets/ \
+    --arch vit_small \
+    --n_way 5 \
+    --k_shot 5 \
+    --trained_model_type metaft \
+    --optim_steps_online 15 \
+    --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/fc100_224/vit_small/ep_1601/bs_/outdim_/5260cb38a356fa2ff4e4572e99d5abce \
+    --dataset fc100
+

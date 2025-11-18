@@ -1,0 +1,44 @@
+export WANDB_API_KEY="654322757bc621b514dc2592badff0c6eeefe6ad"
+
+1. cifar_fs
+1.1. default
+
+python train_metatrain_FewTURE.py \
+    --arch vit_small \
+    --patch_size 16 \
+    --num_epochs 200 \
+    --num_episodes_per_epoch 100 \
+    --data_path /workspace/work1/FewTURE/datasets/ \
+    --query 10 \
+    --n_way 5 \
+    --k_shot 1 \
+    --num_validation_episodes 200 \
+    --dataset cifar_fs \
+    --chkpt_epoch 1600 \
+    --num_workers 10 \
+    --mdl_checkpoint_path /workspace/models/cifar/vit
+
+
+python eval_FewTURE.py \
+    --data_path /workspace/work1/FewTURE/datasets/ \
+    --arch vit_small \
+    --n_way 5 \
+    --k_shot 1 \
+    --trained_model_type metaft \
+    --optim_steps_online 15 \
+    --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/cifar_fs_224/vit_small/ep_1601/bs_/outdim_/e1e6567bdf85c2ac4439097e5632263a \
+    --dataset cifar_fs
+
+
+
+python eval_FewTURE.py \
+    --data_path /workspace/work1/FewTURE/datasets/ \
+    --arch vit_small \
+    --n_way 5 \
+    --k_shot 5 \
+    --trained_model_type metaft \
+    --optim_steps_online 15 \
+    --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/cifar_fs_224/vit_small/ep_1601/bs_/outdim_/00fa335602d5098c8c0876fd2d1594fe \
+    --dataset cifar_fs
+
+
