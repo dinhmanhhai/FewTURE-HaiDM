@@ -272,28 +272,8 @@ def eval_fewture(args, eval_run=None):
     # DeiT and ViT are the same architecture, so we change the name DeiT to ViT to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
 
-    # if the network is using multi-scale features (i.e. swin_tiny, ...)
-    if args.arch in models.__dict__.keys() and 'swin' in args.arch:
-        model = models.__dict__[args.arch](
-            window_size=args.window_size,
-            return_all_tokens=True
-        )
-    # if the network is a vision transformer (i.e. vit_tiny, vit_small, ...)
-    elif args.arch in models.__dict__.keys():
-        model = models.__dict__[args.arch](
-            patch_size=args.patch_size,
-            return_all_tokens=True
-        )
-    else:
-        raise ValueError(f"Unknown architecture: {args.arch}. Please choose one that is supported.")
-
-    # Move model to GPU
-    model = model.cuda()
-
-    # Add arguments to model for easier access
-    model.args = args
-
-    # Load weights from a checkpoint of the model to evaluate -- Note that artifact information has to be adapted!
+    chkpt = None
+    chkpt_state_dict = None
     if args.wandb_mdl_ref:
         assert USE_WANDB, 'Enable wandb to load artifacts.'
         print('\nLoading model file from wandb artifact...')
@@ -328,11 +308,62 @@ def eval_fewture(args, eval_run=None):
         else:
             raise ValueError(f"Model type '{args.trained_model_type}' does not exist. Please check! ")
     elif args.mdl_url:
-        mdl_storage_path = os.path.join(utils.get_base_path(), 'downloaded_chkpts', f'{args.arch}', f'outdim_{out_dim}')
+        mdl_storage_path = os.path.join(utils.get_base_path(), 'downloaded_chkpts', f'{args.arch}', f'outdim_{args.out_dim}')
         download_url(url=args.mdl_url, root=mdl_storage_path, filename=os.path.basename(args.mdl_url))
-        chkpt_state_dict = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)), weights_only=False)['state_dict']
+        chkpt = torch.load(os.path.join(mdl_storage_path, os.path.basename(args.mdl_url)), weights_only=False)
+        chkpt_state_dict = chkpt['state_dict'] if isinstance(chkpt, dict) and 'state_dict' in chkpt else chkpt
     else:
         raise ValueError("Checkpoint not provided or provided one could not found.")
+
+    chkpt_train_args = chkpt.get("args") if isinstance(chkpt, dict) and "args" in chkpt else None
+
+    def _get_attr(source, name, default):
+        if source is not None and hasattr(source, name):
+            return getattr(source, name)
+        return default
+
+    inferred_use_mab = _get_attr(chkpt_train_args, 'use_mab', True)
+    inferred_use_ocab = _get_attr(chkpt_train_args, 'use_ocab', True)
+    inferred_use_drff = _get_attr(chkpt_train_args, 'use_drff', True)
+    drff_in_state_dict = any(k.startswith('drff.') for k in chkpt_state_dict.keys())
+    if not inferred_use_drff and drff_in_state_dict:
+        inferred_use_drff = True
+    resolved_window_size = _get_attr(chkpt_train_args, 'window_size', args.window_size)
+    resolved_drff_scales = _get_attr(chkpt_train_args, 'drff_num_scales', 3)
+
+    setattr(args, 'use_mab', inferred_use_mab)
+    setattr(args, 'use_ocab', inferred_use_ocab)
+    setattr(args, 'use_drff', inferred_use_drff)
+    setattr(args, 'drff_num_scales', resolved_drff_scales)
+    args.window_size = resolved_window_size
+
+    # ============ Build model with inferred architecture settings ============
+    if args.arch in models.__dict__.keys() and 'swin' in args.arch:
+        model = models.__dict__[args.arch](
+            window_size=args.window_size,
+            return_all_tokens=True
+        )
+    elif args.arch in models.__dict__.keys():
+        use_multi_attention = inferred_use_mab or inferred_use_ocab or inferred_use_drff
+        vit_kwargs = dict(
+            patch_size=args.patch_size,
+            return_all_tokens=True
+        )
+        if use_multi_attention:
+            vit_kwargs.update(dict(
+                use_mab=inferred_use_mab,
+                use_ocab=inferred_use_ocab,
+                window_size=args.window_size,
+                use_drff=inferred_use_drff,
+                drff_num_scales=resolved_drff_scales
+            ))
+        model = models.__dict__[args.arch](**vit_kwargs)
+    else:
+        raise ValueError(f"Unknown architecture: {args.arch}. Please choose one that is supported.")
+
+    model = model.cuda()
+    model.args = args
+
     # Adapt and load state dict into current model for evaluation
     msg = model.load_state_dict(utils.match_statedict(chkpt_state_dict), strict=False)
     if args.wandb_mdl_ref or args.mdl_checkpoint_path:
@@ -346,16 +377,20 @@ def eval_fewture(args, eval_run=None):
     trd = 'pretrained' if args.trained_model_type == 'pretrained' else 'meta fine-tuned'
     print(f'Parameters successfully loaded from checkpoint. '
           f'Model to be evaluated has been {trd} for {eppt} epochs.')
-    if args.trained_model_type == 'metaft':
+    if args.trained_model_type == 'metaft' and isinstance(chkpt, dict) and \
+            'val_acc' in chkpt and 'val_conf' in chkpt:
         print(f'Model has achieved a validation accuracy of {chkpt["val_acc"]:.2f}+-{chkpt["val_conf"]:.4f}!')
     print(f'Using a similarity temperature of {args.similarity_temp:.4f} to rescale logits.')
     print(f'Info on loaded state dict and dropped head parameters: \n{msg}')
     print("Note: If unexpected_keys other than parameters relating to the discarded 'head' exist, go and check!")
     # Save args of loaded checkpoint model into folder for reference!
-    try:
-        with (Path(args.output_dir) / "args_checkpoint_model.txt").open("w") as f:
-            f.write(json.dumps(chkpt["args"].__dict__, indent=4))
-    except:
+    if chkpt_train_args is not None:
+        try:
+            with (Path(args.output_dir) / "args_checkpoint_model.txt").open("w") as f:
+                f.write(json.dumps(chkpt_train_args.__dict__, indent=4))
+        except Exception:
+            print("Arguments used during training not available, and will thus not be stored in eval folder.")
+    else:
         print("Arguments used during training not available, and will thus not be stored in eval folder.")
 
     # Set model to evaluation mode and freeze -- not updating of main parameters at inference time
@@ -407,11 +442,12 @@ def eval_fewture(args, eval_run=None):
             mdl_art = wandb.Artifact(name=name_str, type="results",
                                      description="Results of the evaluation.",
                                      metadata=model_config)
-            try:
-                with mdl_art.new_file('args_checkpoint_model.txt', 'w') as file:
-                    file.write(json.dumps(chkpt["args"].__dict__, indent=4))
-            except:
-                print("Arguments used during training not available, and will thus not be stored in eval folder.")
+            if chkpt_train_args is not None:
+                try:
+                    with mdl_art.new_file('args_checkpoint_model.txt', 'w') as file:
+                        file.write(json.dumps(chkpt_train_args.__dict__, indent=4))
+                except Exception:
+                    print("Arguments used during training not available, and will thus not be stored in eval folder.")
 
             if args.trained_model_type == 'pretrained':
                 res_str = f"Results achieved with {args.arch} pretrained for {args.chkpt_epoch} epochs on the " \
