@@ -39,7 +39,13 @@ class CategoriesSampler():
             classes = torch.randperm(len(self.m_ind))[:self.n_cls]  # random sample num_class indexes,e.g. 5
             for c in classes:
                 l = self.m_ind[c]  # all data indexs of this class
-                pos = torch.randperm(len(l))[:self.n_per]  # sample n_per data index of this class
+                if len(l) == 0:
+                    raise ValueError(f"Lớp {c} không có mẫu nào trong tập dữ liệu.")
+                if len(l) >= self.n_per:
+                    pos = torch.randperm(len(l))[:self.n_per]  # sample n_per data index of this class
+                else:
+                    # Khi một lớp có ít ảnh hơn số cần lấy, chọn ngẫu nhiên có lặp
+                    pos = torch.randint(low=0, high=len(l), size=(self.n_per,))
                 batch.append(l[pos])
             batch = torch.stack(batch).reshape(-1)
             # no .t() transpose (in contrast to 'permuted' sampler),
