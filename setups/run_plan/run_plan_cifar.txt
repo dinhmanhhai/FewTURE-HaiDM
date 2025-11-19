@@ -2,6 +2,17 @@ export WANDB_API_KEY="654322757bc621b514dc2592badff0c6eeefe6ad"
 
 1. cifar_fs
 1.1. default
+python train_selfsup_pretrain.py \
+  --dataset cifar_fs \
+  --arch vit_small \
+  --data_path /workspace/work1/FewTURE/datasets/ \
+  --output_dir /workspace/work1/FewTURE/pretrain/ \
+  --epochs 500 \
+  --saveckp_freq 40 \
+  --batch_size_per_gpu 64 \
+  --seed 42 \
+  --num_workers 10
+
 
 python train_metatrain_FewTURE.py \
     --arch vit_small \

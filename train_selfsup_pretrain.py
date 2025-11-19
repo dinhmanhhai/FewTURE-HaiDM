@@ -38,14 +38,19 @@ from PIL import Image
 from torchvision import transforms
 from models.head import iBOTHead
 from loader import DatasetMask
+from setup_datasets import set_up_dataset
 
 ####################################################################
+os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
 USE_WANDB = True
 
 if USE_WANDB:
     import wandb
+
     # Note: Make sure to specify your username for correct logging
     WANDB_USER = 'works-haidinh-ptit'
+
+
 ####################################################################
 
 
@@ -54,8 +59,8 @@ def get_args_parser():
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'deit_tiny', 'deit_small', 'swin_tiny'],
-        help="""Name of architecture to train. We use vit_small and swin_tiny as default architectures in our paper.""")
+                        choices=['vit_tiny', 'vit_small', 'deit_tiny', 'deit_small', 'swin_tiny'],
+                        help="""Name of architecture to train. We use vit_small and swin_tiny as default architectures in our paper.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
         of input square patches - default 16 (for 16x16 patches). Using smaller
         values could lead to better performance but requires more memory. Applies only
@@ -74,18 +79,18 @@ def get_args_parser():
     parser.add_argument('--shared_head_teacher', default=True, type=utils.bool_flag, help="""See above.
         Only works for teacher model. (Default: True)""")
     parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
-        help="""Whether or not to weight normalize the last layer of the head.
+                        help="""Whether or not to weight normalize the last layer of the head.
         Not normalizing leads to better performance but can make the training unstable.
         In our experiments, we typically set this parameter to False with vit_small and True with vit_base.""")
     parser.add_argument('--momentum_teacher', default=0.996, type=float, help="""Base EMA
         parameter for teacher update. The value is increased to 1 during training with cosine schedule.
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_argument('--norm_in_head', default=None,
-        help="Whether to use batch normalizations in projection head (Default: None)")
+                        help="Whether to use batch normalizations in projection head (Default: None)")
     parser.add_argument('--act_in_head', default='gelu',
-        help="Whether to use batch normalizations in projection head (Default: gelu)")
+                        help="Whether to use batch normalizations in projection head (Default: gelu)")
     parser.add_argument('--use_masked_im_modeling', default=True, type=utils.bool_flag,
-        help="Whether to use masked image modeling (mim) in backbone (Default: True)")
+                        help="Whether to use masked image modeling (mim) in backbone (Default: True)")
     parser.add_argument('--pred_ratio', default=0.3, type=float, nargs='+', help="""Ratio of partial prediction.
         If a list of ratio is specified, one of them will be randomly chosen for each patch.""")
     parser.add_argument('--pred_ratio_var', default=0, type=float, nargs='+', help="""Variance of partial prediction
@@ -97,10 +102,20 @@ def get_args_parser():
         loss over [CLS] tokens (Default: 1.0)""")
     parser.add_argument('--lambda2', default=1.0, type=float, help="""loss weight for beit 
         loss over masked patch tokens (Default: 1.0)""")
-        
+
+    # Multi-attention architecture parameters
+    parser.add_argument('--use_mab', default=True, type=utils.bool_flag,
+                        help="""Whether to use Mixed Attention Block (MAB) with Window-based Multi-Head Self-Attention and Channel Attention (Default: False)""")
+    parser.add_argument('--use_ocab', default=True, type=utils.bool_flag,
+                        help="""Whether to use Overlapping Cross-Attention Block (OCAB) (Default: False)""")
+    parser.add_argument('--use_drff', default=True, type=utils.bool_flag,
+                        help="""Whether to use Dual Reconstruction Feature Fusion (DRFF) module (Default: False)""")
+    parser.add_argument('--drff_num_scales', default=3, type=int,
+                        help="""Number of scales for DRFF module (Default: 3)""")
+
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
-        help="""Initial value for the teacher temperature: 0.04 works well in most cases.
+                        help="""Initial value for the teacher temperature: 0.04 works well in most cases.
         Try decreasing it if the training loss does not decrease.""")
     parser.add_argument('--teacher_temp', default=0.04, type=float, help="""Final value (after linear warmup)
         of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
@@ -110,7 +125,7 @@ def get_args_parser():
     parser.add_argument('--teacher_patch_temp', default=0.07, type=float, help=""""See 
         `--teacher_temp`""")
     parser.add_argument('--warmup_teacher_temp_epochs', default=30, type=int,
-        help='Number of warmup epochs for the teacher temperature (Default: 30).')
+                        help='Number of warmup epochs for the teacher temperature (Default: 30).')
 
     # Training/Optimization parameters
     parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
@@ -126,7 +141,7 @@ def get_args_parser():
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size_per_gpu', default=128, type=int,
-        help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
+                        help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
@@ -135,37 +150,38 @@ def get_args_parser():
         linear warmup (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.""")
     parser.add_argument("--warmup_epochs", default=10, type=int,
-        help="Number of epochs for the linear learning-rate warm up.")
+                        help="Number of epochs for the linear learning-rate warm up.")
     parser.add_argument('--min_lr', type=float, default=1e-6, help="""Target LR at the
         end of optimization. We use a cosine LR schedule with linear warmup.""")
     parser.add_argument('--optimizer', default='adamw', type=str,
-        choices=['adamw', 'sgd', 'lars'], help="""Type of optimizer. We recommend using adamw with ViTs and Swin.""")
+                        choices=['adamw', 'sgd', 'lars'],
+                        help="""Type of optimizer. We recommend using adamw with ViTs and Swin.""")
     parser.add_argument('--load_from', default=None, help="""Path to load checkpoints to resume training.""")
     parser.add_argument('--drop_path', type=float, default=0.1, help="""Drop path rate for student network.""")
 
     # Multi-crop parameters
     parser.add_argument('--image_size', type=int, default=224,
-        help="""Size of the squared input images, 224 for imagenet-style.
+                        help="""Size of the squared input images, 224 for imagenet-style.
         Note that the --local_crops_size must be chosen appropriately considering this image size!""")
     parser.add_argument('--global_crops_number', type=int, default=2, help="""Number of global
         views to generate. Default is to use two global crops. """)
     parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.14, 1.),
-        help="""Scale range of the cropped image before resizing, relatively to the origin image.
+                        help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""")
     parser.add_argument('--local_crops_number', type=int, default=0, help="""Number of small
         local views to generate. Set this parameter to 0 to disable multi-crop training.
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """)
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
-        help="""Scale range of the cropped image before resizing, relatively to the origin image.
+                        help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
     parser.add_argument('--local_crops_size', type=int, default=96,
-        help="""Crop region size of local views to generate. MUST be chosen wrt image size! Default for ImageNet-based 
+                        help="""Crop region size of local views to generate. MUST be chosen wrt image size! Default for ImageNet-based 
         data is 96 (input image 224), but has to be adapted for other FSL datasets of input size 84!""")
 
     # Dataset related parameters
     parser.add_argument('--dataset', default='miniimagenet', type=str,
-                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs'],
+                        choices=['miniimagenet', 'tieredimagenet', 'fc100', 'cifar_fs', 'tea_leaves'],
                         help='Please specify the name of the dataset to be used for training.')
     parser.add_argument('--data_path', default=None, type=str,
                         help='Please specify path to the root folder containing the training dataset(s). If dataset '
@@ -247,7 +263,7 @@ def pretrain_fewture(args):
     if args.arch in models.__dict__.keys() and 'swin' in args.arch:
         student = models.__dict__[args.arch](
             window_size=args.window_size,
-            return_all_tokens=True, 
+            return_all_tokens=True,
             masked_im_modeling=args.use_masked_im_modeling,
         )
         teacher = models.__dict__[args.arch](
@@ -258,15 +274,29 @@ def pretrain_fewture(args):
         embed_dim = student.num_features
     # if the network is a vision transformer (i.e. vit_tiny, vit_small, ...)
     elif args.arch in models.__dict__.keys():
+        # Calculate input resolution for MAB/OCAB
+        image_size = args.image_size
+        patches_resolution = (image_size // args.patch_size, image_size // args.patch_size)
+
         student = models.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path,
             return_all_tokens=True,
             masked_im_modeling=args.use_masked_im_modeling,
+            use_mab=args.use_mab,
+            use_ocab=args.use_ocab,
+            use_drff=args.use_drff,
+            drff_num_scales=args.drff_num_scales,
+            window_size=args.window_size,
         )
         teacher = models.__dict__[args.arch](
             patch_size=args.patch_size,
             return_all_tokens=True,
+            use_mab=args.use_mab,
+            use_ocab=args.use_ocab,
+            use_drff=args.use_drff,
+            drff_num_scales=args.drff_num_scales,
+            window_size=args.window_size,
         )
         embed_dim = student.embed_dim
     # otherwise, we could check if the architecture is in torchvision models;
@@ -291,7 +321,7 @@ def pretrain_fewture(args):
     teacher = utils.MultiCropWrapper(
         teacher,
         iBOTHead(
-            embed_dim, 
+            embed_dim,
             args.out_dim,
             patch_out_dim=args.patch_out_dim,
             norm=args.norm_in_head,
@@ -313,8 +343,15 @@ def pretrain_fewture(args):
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], broadcast_buffers=False) if \
-        'swin' in args.arch else nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+
+    # Check if using multi-attention architecture (MAB/OCAB/DRFF) which may have unused parameters
+    use_multi_attn = args.use_mab or args.use_ocab or args.use_drff
+    student = nn.parallel.DistributedDataParallel(
+        student,
+        device_ids=[args.gpu],
+        broadcast_buffers=False if 'swin' in args.arch else True,
+        find_unused_parameters=use_multi_attn  # Enable unused parameter detection for multi-attention architectures
+    )
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
     # there is no backpropagation through the teacher, so no need for gradients
@@ -367,8 +404,8 @@ def pretrain_fewture(args):
     )
     # momentum parameter is increased to 1. during training with a cosine schedule
     momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1,
-                                            args.epochs, len(data_loader))
-                  
+                                               args.epochs, len(data_loader))
+
     print(f"Loss, optimiser and schedulers ready.")
 
     # ============ optionally resume training ... ============
@@ -393,8 +430,8 @@ def pretrain_fewture(args):
 
         # ============ training one epoch of self-supervised pretraining using MIM ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args, run)
+                                      data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
+                                      epoch, fp16_scaler, args, run)
 
         # ============ writing logs ... ============
         save_dict = {
@@ -419,7 +456,7 @@ def pretrain_fewture(args):
             # Log the averaged log_stats also to wandb, can later be plotted over epochs
             if args.use_wandb:
                 run.log(log_stats)
-        
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -479,10 +516,11 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             # get global views
             teacher_output = teacher(images[:args.global_crops_number])
             student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number])
-            
+
             # get local views
             student.module.backbone.masked_im_modeling = False
-            student_local_cls = student(images[args.global_crops_number:])[0] if len(images) > args.global_crops_number else None
+            student_local_cls = student(images[args.global_crops_number:])[0] if len(
+                images) > args.global_crops_number else None
             student.module.backbone.masked_im_modeling = args.use_masked_im_modeling
 
             all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
@@ -495,7 +533,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         # log statistics
         probs1 = teacher_output[0].chunk(args.global_crops_number)
         probs2 = student_output[0].chunk(args.global_crops_number)
-        pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1]) 
+        pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1])
         pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
         acc = (pred1 == pred2).sum() / pred1.size(0)
         pred_labels.append(pred1)
@@ -559,9 +597,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
 
 
 class iBOTLoss(nn.Module):
-    def __init__(self, out_dim, patch_out_dim, ngcrops, nlcrops, warmup_teacher_temp, 
-                 teacher_temp, warmup_teacher_temp2, teacher_temp2, 
-                 warmup_teacher_temp_epochs, nepochs, student_temp=0.1, 
+    def __init__(self, out_dim, patch_out_dim, ngcrops, nlcrops, warmup_teacher_temp,
+                 teacher_temp, warmup_teacher_temp2, teacher_temp2,
+                 warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
                  center_momentum=0.9, center_momentum2=0.9,
                  lambda1=1.0, lambda2=1.0, mim_start_epoch=0):
         super().__init__()
@@ -599,7 +637,7 @@ class iBOTLoss(nn.Module):
         """
         student_cls, student_patch = student_output
         teacher_cls, teacher_patch = teacher_output
-        
+
         if student_local_cls is not None:
             student_cls = torch.cat([student_cls, student_local_cls])
 
@@ -608,7 +646,7 @@ class iBOTLoss(nn.Module):
         student_cls_c = student_cls.chunk(self.ncrops)
         student_patch = student_patch / self.student_temp
         student_patch_c = student_patch.chunk(self.ngcrops)
-        
+
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         temp2 = self.teacher_temp2_schedule[epoch]
@@ -631,11 +669,11 @@ class iBOTLoss(nn.Module):
                     loss1 = torch.sum(-teacher_cls_c[q] * F.log_softmax(student_cls_c[v], dim=-1), dim=-1)
                     total_loss1 += loss1.mean()
                     n_loss_terms1 += 1
-            
+
         total_loss1 = total_loss1 / n_loss_terms1 * self.lambda1
         total_loss2 = total_loss2 / n_loss_terms2 * self.lambda2
         total_loss = dict(cls=total_loss1, patch=total_loss2, loss=total_loss1 + total_loss2)
-        self.update_center(teacher_cls, teacher_patch)                  
+        self.update_center(teacher_cls, teacher_patch)
         return total_loss
 
     @torch.no_grad()
@@ -712,29 +750,6 @@ class DataAugmentationFewTURE(object):
         for _ in range(self.local_crops_number):
             crops.append(self.local_transfo(image))
         return crops
-
-
-def set_up_dataset(args):
-    # Datasets and corresponding number of classes
-    if args.dataset == 'miniimagenet':
-        # (Vinyals et al., 2016), (Ravi & Larochelle, 2017)
-        # train num_class = 64
-        from datasets.dataloaders.miniimagenet.miniimagenet import MiniImageNet as dataset
-    elif args.dataset == 'tieredimagenet':
-        # (Ren et al., 2018)
-        # train num_class = 351
-        from datasets.dataloaders.tieredimagenet.tieredimagenet import tieredImageNet as dataset
-    elif args.dataset == 'fc100':
-        # (Oreshkin et al., 2018) Fewshot-CIFAR 100 -- orig. images 32x32
-        # train num_class = 60
-        from datasets.dataloaders.fc100.fc100 import DatasetLoader as dataset
-    elif args.dataset == 'cifar_fs':
-        # (Bertinetto et al., 2018) CIFAR-FS (100) -- orig. images 32x32
-        # train num_class = 64
-        from datasets.dataloaders.cifar_fs.cifar_fs import DatasetLoader as dataset
-    else:
-        raise ValueError('Unknown dataset. Please check your selection!')
-    return dataset
 
 
 if __name__ == '__main__':

@@ -1,76 +1,41 @@
 1. Tea leaves
 1.1. default 
 
-# NOTE: tea_leaves dataset not in standard choices, may need custom dataloader
-# python train_selfsup_pretrain.py \
-#   --dataset tea_leaves \
-#   --arch vit_small \
-#   --data_path /workspace/work1/FewTURE/datasets/ \
-#   --output_dir /workspace/work1/FewTURE/pretrain/ \
-#   --epochs 350 \
-#   --saveckp_freq 40 \
-#   --seed 42 \
-#   --num_workers 10
+NOTE: tea_leaves dataset not in standard choices, may need custom dataloader
+python train_selfsup_pretrain.py \
+  --dataset tea_leaves \
+  --arch vit_small \
+  --data_path /workspace/work1/FewTURE/datasets/ \
+  --output_dir /workspace/work1/FewTURE/pretrain/ \
+  --epochs 500 \
+  --saveckp_freq 40 \
+  --batch_size_per_gpu 64 \
+  --seed 42 \
+  --num_workers 10
 
 
-# NOTE: tea_leaves dataset not in standard choices, may need custom dataloader
-# python train_metatrain_FewTURE.py \
-#     --arch vit_small \
-#     --patch_size 16 \
-#     --num_epochs 100 \
-#     --num_episodes_per_epoch 50 \
-#     --data_path /workspace/work2/FewTURE/datasets/ \
-#     --query 10 \
-#     --n_way 5 \
-#     --k_shot 1 \
-#     --num_validation_episodes 300 \
-#     --dataset tea_leaves \
-#     --chkpt_epoch 320 \
-#     --num_workers 8 \
-#     --mdl_checkpoint_path /workspace/work2/FewTURE/pretrain/tea_leaves/tea_leaves_224/vit_small/outdim_8192/bs_128/ep350/c5e280b9676f47dd1d4558729d2b75fd
-
-# /workspace/work2/FewTURE/meta_fewture/tea_leaves_224/vit_small/ep_321/bs_128/outdim_8192/00e4d6fe4b17b60e6cd83a56e1bc036c
-
-/workspace/work1/FewTURE/meta_fewture/tea_leaves_224/vit_small/ep_121/bs_128/outdim_8192/89916c81d4339357d82414cfd96736c2
-
-/workspace/work1/FewTURE/meta_fewture/tea_leaves_224/vit_small/ep_121/bs_128/outdim_8192/c1e4911e68a226b8c9ea1f670254b00b
+python train_metatrain_FewTURE.py \
+    --arch vit_small \
+    --patch_size 16 \
+    --num_epochs 100 \
+    --num_episodes_per_epoch 100 \
+    --data_path /workspace/work1/FewTURE/datasets/ \
+    --query 10 \
+    --n_way 5 \
+    --k_shot 1 \
+    --num_validation_episodes 480 \
+    --dataset tea_leaves \
+    --chkpt_epoch 320 \
+    --num_workers 8 \
+    --mdl_checkpoint_path /workspace/work1/FewTURE/pretrain/tea_leaves_224/vit_small/outdim_8192/bs_64/ep500/1cd887d5734bb636859afdf3962ad419
 
 # NOTE: tea_leaves dataset not in standard choices, may need custom dataloader
-# python eval_FewTURE.py \
-#     --data_path /workspace/work1/FewTURE/datasets/ \
-#     --arch vit_small \
-#     --n_way 5 \
-#     --k_shot 1 \
-#     --trained_model_type metaft \
-#     --optim_steps_online 15 \
-#     --mdl_checkpoint_path /workspace/work2/FewTURE/meta_fewture/tea_leaves_224/vit_small/ep_321/bs_128/outdim_8192/00e4d6fe4b17b60e6cd83a56e1bc036c \
-#     --dataset tea_leaves
-
-# Test Acc 67.6933 + 0.9603
-
-
-# python eval_FewTURE.py \
-#     --data_path /workspace/work1/FewTURE/datasets/ \
-#     --arch vit_small \
-#     --n_way 5 \
-#     --k_shot 1 \
-#     --trained_model_type metaft \
-#     --optim_steps_online 15 \
-#     --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/tea_leaves_224/vit_small/ep_121/bs_128/outdim_8192/c1e4911e68a226b8c9ea1f670254b00b \
-#     --dataset tea_leaves
-
-# Test Acc 70.8356 + 0.9540
-
-
-# NOTE: tea_leaves dataset not in standard choices, may need custom dataloader
-# python eval_FewTURE.py \
-#     --data_path /workspace/work1/FewTURE/datasets/ \
-#     --arch vit_small \
-#     --n_way 5 \
-#     --k_shot 5 \
-#     --trained_model_type metaft \
-#     --optim_steps_online 15 \
-#     --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/tea_leaves_224/vit_small/ep_121/bs_128/outdim_8192/c1e4911e68a226b8c9ea1f670254b00b \
-#     --dataset tea_leaves
-
-Test Acc 82.5711 + 0.5460
+python eval_FewTURE.py \
+    --data_path /workspace/work1/FewTURE/datasets/ \
+    --arch vit_small \
+    --n_way 5 \
+    --k_shot 1 \
+    --trained_model_type metaft \
+    --optim_steps_online 15 \
+    --mdl_checkpoint_path /workspace/work2/FewTURE/meta_fewture/tea_leaves_224/vit_small/ep_321/bs_128/outdim_8192/00e4d6fe4b17b60e6cd83a56e1bc036c \
+    --dataset tea_leaves

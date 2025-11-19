@@ -515,7 +515,7 @@ def eval_pred(label, pred):
     nmi = metrics.normalized_mutual_info_score(label, pred)
     ari = metrics.adjusted_rand_score(label, pred)
     f = metrics.fowlkes_mallows_score(label, pred)
-    return nmi, ari, f, -1
+    return nmi, ari, f
 
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):

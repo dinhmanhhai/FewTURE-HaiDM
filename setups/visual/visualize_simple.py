@@ -243,7 +243,7 @@ def main():
     
     # Load checkpoint
     print(f"   Loading checkpoint: {args.model_path}")
-    checkpoint = torch.load(args.model_path, map_location='cpu')
+    checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=False)
     if 'params' in checkpoint:
         state_dict = checkpoint['params']
     elif 'state_dict' in checkpoint:

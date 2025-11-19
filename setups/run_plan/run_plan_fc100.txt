@@ -28,15 +28,11 @@ python eval_FewTURE.py \
     --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/fc100_224/vit_small/ep_1601/bs_/outdim_/5736ea392dc7c85c1c54be44d753c100 \
     --dataset fc100
 
-
-
-python eval_FewTURE.py \
-    --data_path /workspace/work1/FewTURE/datasets/ \
+python visualize_simple.py \
+    --image_path /workspace/work1/FewTURE/datasets/FC100/test/n00000098/n0000009800000058.jpg \
+    --model_path /workspace/work1/FewTURE/meta_fewture/fc100_224/vit_small/ep_1601/bs_/outdim_/5736ea392dc7c85c1c54be44d753c100/meta_best.pth \
     --arch vit_small \
-    --n_way 5 \
-    --k_shot 5 \
-    --trained_model_type metaft \
-    --optim_steps_online 15 \
-    --mdl_checkpoint_path /workspace/work1/FewTURE/meta_fewture/fc100_224/vit_small/ep_1601/bs_/outdim_/5260cb38a356fa2ff4e4572e99d5abce \
-    --dataset fc100
+    --patch_size 16 \
+    --image_size 224 \
+    --output_dir ./attention_viz
 

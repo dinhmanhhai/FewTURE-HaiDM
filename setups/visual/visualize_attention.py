@@ -21,8 +21,8 @@ import utils
 try:
     from models.reconstruction import DualReconstruction
 except ImportError:
-    # Fallback if reconstruction is in models_copy
-    from models_copy.reconstruction import DualReconstruction
+    # Fallback if reconstruction is in models
+    from models.reconstruction import DualReconstruction
 
 
 def load_image(image_path, image_size=224):
